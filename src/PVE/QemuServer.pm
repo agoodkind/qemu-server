@@ -544,6 +544,12 @@ args: -no-reboot -smbios 'type=0,vendor=FOO'
 NOTE: this option is for experts only.
 EODESCR
     },
+    vsock => {
+        optional => 1,
+        type => 'boolean',
+        description => "Enable a virtio vsock device with the VM ID as its guest CID.",
+        default => 0,
+    },
     tablet => {
         optional => 1,
         type => 'boolean',
@@ -3295,6 +3301,11 @@ sub config_to_command {
 
     if ($conf->{vmgenid}) {
         push @$devices, '-device', 'vmgenid,guid=' . $conf->{vmgenid};
+    }
+
+    if ($conf->{vsock}) {
+        push @$devices, '-device',
+            "vhost-vsock-pci,id=vsock0,guest-cid=$vmid" . print_pci_addr('vsock', $arch);
     }
 
     # add usb controllers

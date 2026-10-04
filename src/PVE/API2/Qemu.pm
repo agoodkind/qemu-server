@@ -1011,6 +1011,8 @@ my $check_vm_modify_config_perm = sub {
             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Memory']);
         } elsif ($hwtypeoptions->{$opt}) {
             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.HWType']);
+        } elsif ($opt eq 'vsock') {
+            $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Vsock']);
         } elsif ($generaloptions->{$opt}) {
             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Options']);
             # special case for startup since it changes host behaviour
@@ -2199,6 +2201,11 @@ my $update_vm_api = sub {
 
     &$check_vm_modify_config_perm($rpcenv, $authuser, $vmid, undef, [keys %$param]);
 
+    # revert copies the current value into $param after this point, so check it here
+    &$check_vm_modify_config_perm(
+        $rpcenv, $authuser, $vmid, undef, [grep { $_ eq 'vsock' } keys %$revert],
+    );
+
     &$check_storage_access(
         $rpcenv, $authuser, $storecfg, $vmid, $param, undef, $extraction_storage,
     );
@@ -2649,6 +2656,7 @@ my $vm_config_perm_list = [
     'VM.Config.Memory',
     'VM.Config.Network',
     'VM.Config.HWType',
+    'VM.Config.Vsock',
     'VM.Config.Options',
     'VM.Config.Cloudinit',
 ];
