@@ -39,6 +39,9 @@ my $GUEST_EXEC_ID_BYTES = 6;
 my $GUEST_EXEC_ID_ATTEMPTS = 10;
 my $GUEST_EXEC_TIMEOUT_EXITCODE = 124;
 my $GUEST_SIGNAL_EXITCODE_BASE = 128;
+# qemu-ga disables guest-exec and guest-exec-status while guest filesystems are frozen.
+my $GUEST_DISABLED_COMMAND_REGEX =
+    qr/\AAgent error: Command guest-exec(?:-status)? has been disabled/;
 
 my $decode_guest_base64 = sub {
     my ($name, $value) = @_;
@@ -82,25 +85,56 @@ my $assert_guest_agent = sub {
     return $conf;
 };
 
+my $sleep_before_poll = sub {
+    my ($interval, $deadline) = @_;
+
+    my $remaining = $deadline - Time::HiRes::time();
+    return undef if $remaining <= 0;
+
+    if ($interval > $remaining) {
+        Time::HiRes::sleep($remaining);
+    } else {
+        Time::HiRes::sleep($interval);
+    }
+    $interval *= 2;
+    $interval = $GUEST_POLL_MAX_SECONDS if $interval > $GUEST_POLL_MAX_SECONDS;
+    return $interval;
+};
+
 # The guest agent deletes an exited command record after returning its status.
 my $wait_for_guest_exit = sub {
     my ($vmid, $conf, $guest_pid, $deadline) = @_;
 
     my $interval = $GUEST_POLL_MIN_SECONDS;
     while (1) {
-        my $status = PVE::QemuServer::Agent::qemu_exec_status($vmid, $conf, $guest_pid);
-        return $status if $status->{exited};
-
-        my $remaining = $deadline - Time::HiRes::time();
-        return undef if $remaining <= 0;
-
-        if ($interval > $remaining) {
-            Time::HiRes::sleep($remaining);
-        } else {
-            Time::HiRes::sleep($interval);
+        my $status =
+            eval { PVE::QemuServer::Agent::qemu_exec_status($vmid, $conf, $guest_pid) };
+        if (my $error = $@) {
+            die $error if $error !~ $GUEST_DISABLED_COMMAND_REGEX;
+        } elsif ($status->{exited}) {
+            return $status;
         }
-        $interval *= 2;
-        $interval = $GUEST_POLL_MAX_SECONDS if $interval > $GUEST_POLL_MAX_SECONDS;
+
+        $interval = $sleep_before_poll->($interval, $deadline);
+        return undef if !defined($interval);
+    }
+};
+
+# A disabled guest-exec response means the command has not started.
+my $start_guest_command = sub {
+    my ($vmid, $conf, $input, $command, $deadline) = @_;
+
+    my $interval = $GUEST_POLL_MIN_SECONDS;
+    while (1) {
+        # qemu_exec removes the program from the supplied array.
+        my $started =
+            eval { PVE::QemuServer::Agent::qemu_exec($vmid, $conf, $input, [@$command]) };
+        my $error = $@;
+        return $started if !$error;
+        die $error if $error !~ $GUEST_DISABLED_COMMAND_REGEX;
+
+        $interval = $sleep_before_poll->($interval, $deadline);
+        die $error if !defined($interval);
     }
 };
 
@@ -137,11 +171,10 @@ my $run_in_vm = sub {
     # Omitting input-data connects standard input to /dev/null.
     $input = undef if defined($input) && !length($input);
 
-    # qemu_exec removes the program from the supplied array.
-    my $started = PVE::QemuServer::Agent::qemu_exec($vmid, $conf, $input, [@$command]);
+    my $deadline = Time::HiRes::time() + $timeout;
+    my $started = $start_guest_command->($vmid, $conf, $input, $command, $deadline);
     my $guest_pid = $started->{pid};
 
-    my $deadline = Time::HiRes::time() + $timeout;
     my $status = $wait_for_guest_exit->($vmid, $conf, $guest_pid, $deadline);
     my $timed_out = 0;
     if (!$status) {
