@@ -58,6 +58,7 @@ use PVE::Network;
 use PVE::Firewall;
 use PVE::API2::Firewall::VM;
 use PVE::API2::Qemu::Agent;
+use PVE::API2::Qemu::Guest;
 use PVE::API2::Qemu::HMPPerms;
 use PVE::VZDump::Plugin;
 use PVE::DataCenterConfig;
@@ -1681,6 +1682,10 @@ __PACKAGE__->register_method({
             { subdir => 'firewall' },
             { subdir => 'mtunnel' },
             { subdir => 'remote_migrate' },
+            { subdir => 'exec' },
+            { subdir => 'exec-status' },
+            { subdir => 'file-read' },
+            { subdir => 'file-write' },
         ];
 
         return $res;
@@ -1696,6 +1701,8 @@ __PACKAGE__->register_method({
     subclass => "PVE::API2::Qemu::Agent",
     path => '{vmid}/agent',
 });
+
+PVE::API2::Qemu::Guest::register_methods(__PACKAGE__);
 
 __PACKAGE__->register_method({
     name => 'rrd',
