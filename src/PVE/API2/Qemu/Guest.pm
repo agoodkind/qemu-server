@@ -85,20 +85,17 @@ my $assert_guest_agent = sub {
     return $conf;
 };
 
-my $sleep_before_poll = sub {
-    my ($interval, $deadline) = @_;
+my $plan_poll = sub {
+    my ($interval, $deadline, $now) = @_;
 
-    my $remaining = $deadline - Time::HiRes::time();
-    return undef if $remaining <= 0;
+    my $remaining = $deadline - $now;
+    return (0, $interval, 1) if $remaining <= 0;
 
-    if ($interval > $remaining) {
-        Time::HiRes::sleep($remaining);
-    } else {
-        Time::HiRes::sleep($interval);
-    }
-    $interval *= 2;
-    $interval = $GUEST_POLL_MAX_SECONDS if $interval > $GUEST_POLL_MAX_SECONDS;
-    return $interval;
+    my $wait = $interval;
+    $wait = $remaining if $wait > $remaining;
+    my $next_interval = $interval * 2;
+    $next_interval = $GUEST_POLL_MAX_SECONDS if $next_interval > $GUEST_POLL_MAX_SECONDS;
+    return ($wait, $next_interval, 0);
 };
 
 # The guest agent deletes an exited command record after returning its status.
@@ -115,8 +112,12 @@ my $wait_for_guest_exit = sub {
             return $status;
         }
 
-        $interval = $sleep_before_poll->($interval, $deadline);
-        return undef if !defined($interval);
+        my ($wait, $next_interval, $expired) =
+            $plan_poll->($interval, $deadline, Time::HiRes::time());
+        return undef if $expired;
+
+        Time::HiRes::sleep($wait);
+        $interval = $next_interval;
     }
 };
 
@@ -133,8 +134,12 @@ my $start_guest_command = sub {
         return $started if !$error;
         die $error if $error !~ $GUEST_DISABLED_COMMAND_REGEX;
 
-        $interval = $sleep_before_poll->($interval, $deadline);
-        die $error if !defined($interval);
+        my ($wait, $next_interval, $expired) =
+            $plan_poll->($interval, $deadline, Time::HiRes::time());
+        die $error if $expired;
+
+        Time::HiRes::sleep($wait);
+        $interval = $next_interval;
     }
 };
 
