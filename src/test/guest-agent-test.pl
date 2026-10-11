@@ -20,6 +20,7 @@ use PVE::API2::Qemu::Guest;
 use PVE::ProcFSTools;
 use PVE::QemuConfig;
 use PVE::QemuServer::Helpers;
+use PVE::QemuServer::Monitor;
 use PVE::RPCEnvironment;
 use PVE::UPID;
 
@@ -36,6 +37,8 @@ my $SOCKET_DIRECTORY = '/var/run/qemu-server';
 my $AGENT_START_SECONDS = 30;
 my $POLL_SECONDS = 60;
 my $EXEC_TIMEOUT_ABOVE_MAXIMUM = 3601;
+my $FROZEN_SECONDS = 3;
+my $FROZEN_COMMAND_EXITCODE = 7;
 my $EXEC_OUTPUT_LIMIT = PVE::API2::Qemu::Guest::exec_output_limit();
 my $FILE_READ_LIMIT = PVE::API2::Qemu::Guest::file_read_limit();
 
@@ -66,6 +69,8 @@ make_path('/var/log/pve/tasks', $SOCKET_DIRECTORY);
 my $socket_path = "$SOCKET_DIRECTORY/$VMID.qga";
 
 sub start_agent {
+    my ($socket_path, $state_directory) = @_;
+
     unlink($socket_path);
     my $pid = fork() // die "fork failed: $!\n";
     if (!$pid) {
@@ -73,9 +78,9 @@ sub start_agent {
             $QEMU_GA,
             '--method', 'unix-listen',
             '--path', $socket_path,
-            '--statedir', $work_directory,
-            '--pidfile', "$work_directory/qemu-ga.pid",
-            '--logfile', "$work_directory/qemu-ga.log",
+            '--statedir', $state_directory,
+            '--pidfile', "$state_directory/qemu-ga.pid",
+            '--logfile', "$state_directory/qemu-ga.log",
         ) or POSIX::_exit(127);
     }
 
@@ -96,13 +101,17 @@ sub stop_agent {
     waitpid($pid, 0);
 }
 
-my $agent_pid = start_agent();
+my $agent_pid = start_agent($socket_path, $work_directory);
+my $frozen_agent_pid;
 END {
-    if ($agent_pid) {
-        my $exit_status = $?;
-        stop_agent($agent_pid);
-        $? = $exit_status;
+    my $exit_status = $?;
+    stop_agent($agent_pid) if $agent_pid;
+    if ($frozen_agent_pid) {
+        # qemu-ga ignores SIGTERM while frozen.
+        kill('KILL', $frozen_agent_pid);
+        waitpid($frozen_agent_pid, 0);
     }
+    $? = $exit_status;
 }
 
 my $rpcenv = PVE::RPCEnvironment->init('priv');
@@ -269,6 +278,126 @@ check_dies(
     qr/execution of command \d+ in VM $VMID failed: Agent error: /,
     sub { run_command({ command => ["$work_directory/missing-program"] }) },
 );
+
+my $thawed_socket_path = "$SOCKET_DIRECTORY/$VMID-thawed.qga";
+my $frozen_socket_path = "$SOCKET_DIRECTORY/$VMID-frozen.qga";
+my $frozen_directory = "$work_directory/frozen";
+my $marker_path = "$work_directory/marker";
+
+# The first agent continues running commands while the second agent answers requests.
+sub select_agent {
+    my ($agent_socket_path) = @_;
+
+    my $link_path = "$socket_path.link";
+    unlink($link_path);
+    link($agent_socket_path, $link_path) && rename($link_path, $socket_path)
+        or die "agent socket replacement from $agent_socket_path to $socket_path failed: $!\n";
+}
+
+sub marker_command {
+    my ($seconds) = @_;
+
+    my $script = 'echo started >> "$1"; sleep "$2"; echo finished; exit "$3"';
+    return ['sh', '-c', $script, 'sh', $marker_path, $seconds, $FROZEN_COMMAND_EXITCODE];
+}
+
+sub marker_line_count {
+    open(my $marker_handle, '<', $marker_path) or return 0;
+    my @lines = <$marker_handle>;
+    close($marker_handle);
+    return scalar(@lines);
+}
+
+sub wait_for_marker_lines {
+    my ($count) = @_;
+
+    my $deadline = Time::HiRes::time() + $POLL_SECONDS;
+    while (marker_line_count() < $count) {
+        die "marker file $marker_path did not contain $count lines within $POLL_SECONDS seconds\n"
+            if Time::HiRes::time() >= $deadline;
+        Time::HiRes::sleep(0.05);
+    }
+}
+
+# qemu-ga starts frozen when qga.state.isfrozen exists in its state directory.
+# The unprivileged test container cannot freeze a filesystem.
+make_path($frozen_directory);
+open(my $frozen_handle, '>', "$frozen_directory/qga.state.isfrozen")
+    or die "file open failed for $frozen_directory/qga.state.isfrozen: $!\n";
+close($frozen_handle) or die "file close failed for $frozen_directory/qga.state.isfrozen: $!\n";
+unlink($thawed_socket_path);
+link($socket_path, $thawed_socket_path)
+    or die "socket link from $socket_path to $thawed_socket_path failed: $!\n";
+$frozen_agent_pid = start_agent($frozen_socket_path, $frozen_directory);
+
+my $frozen_status_pid = call_exec({ command => marker_command(5) });
+wait_for_marker_lines(1);
+select_agent($frozen_socket_path);
+Time::HiRes::sleep($FROZEN_SECONDS);
+select_agent($thawed_socket_path);
+my $frozen_status = wait_for_exit($frozen_status_pid);
+check_equal(
+    'exec-status returns exit code 7 after guest-exec-status resumes',
+    $frozen_status->{exitcode},
+    $FROZEN_COMMAND_EXITCODE,
+);
+check_equal(
+    'exec-status returns standard output after guest-exec-status resumes',
+    $frozen_status->{stdout},
+    "finished\n",
+);
+check_equal('command starts once despite disabled guest-exec-status', marker_line_count(), 1);
+
+select_agent($frozen_socket_path);
+my $frozen_start_pid = call_exec({ command => marker_command(0) });
+Time::HiRes::sleep($FROZEN_SECONDS);
+check_equal('command does not start while guest-exec is disabled', marker_line_count(), 1);
+select_agent($thawed_socket_path);
+my $frozen_start_status = wait_for_exit($frozen_start_pid);
+check_equal(
+    'exec-status returns exit code 7 after guest-exec resumes',
+    $frozen_start_status->{exitcode},
+    $FROZEN_COMMAND_EXITCODE,
+);
+check_equal(
+    'exec-status returns standard output after guest-exec resumes',
+    $frozen_start_status->{stdout},
+    "finished\n",
+);
+check_equal('command starts once after guest-exec resumes', marker_line_count(), 2);
+
+# The command exits before the timeout; a successful status read would return exit code 7.
+my $frozen_timeout_pid = call_exec({ command => marker_command(2), timeout => 6 });
+wait_for_marker_lines(3);
+select_agent($frozen_socket_path);
+my $frozen_timeout_status = wait_for_exit($frozen_timeout_pid);
+check_equal(
+    'exec-status returns exit code 124 while guest-exec-status stays disabled',
+    $frozen_timeout_status->{exitcode},
+    124,
+);
+check_equal(
+    'exec-status reports timed-out while guest-exec-status stays disabled',
+    $frozen_timeout_status->{'timed-out'},
+    1,
+);
+
+# The thawed second agent has no record of commands started by the first agent.
+PVE::QemuServer::Monitor::mon_cmd($VMID, 'guest-fsfreeze-thaw');
+select_agent($thawed_socket_path);
+my $other_agent_pid = call_exec({ command => marker_command(2) });
+wait_for_marker_lines(4);
+select_agent($frozen_socket_path);
+check_dies(
+    'exec-status reports an unknown process without waiting for the command timeout',
+    qr/execution of command $other_agent_pid in VM $VMID failed: Agent error: PID /,
+    sub { wait_for_exit($other_agent_pid) },
+);
+select_agent($thawed_socket_path);
+
+stop_agent($frozen_agent_pid);
+$frozen_agent_pid = undef;
+unlink($thawed_socket_path, $frozen_socket_path);
 
 my $file_path = "$work_directory/written file";
 my $file_content = join('', map { chr($_) } 0 .. 255) x 16;
