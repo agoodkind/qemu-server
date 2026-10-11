@@ -331,6 +331,14 @@ my $with_guest_file = sub {
     return $result;
 };
 
+sub exec_output_limit {
+    return $GUEST_EXEC_OUTPUT_LIMIT;
+}
+
+sub file_read_limit {
+    return $GUEST_FILE_READ_LIMIT;
+}
+
 sub register_methods {
     my ($class) = @_;
 

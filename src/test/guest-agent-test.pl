@@ -12,23 +12,32 @@ use MIME::Base64 qw(decode_base64 encode_base64);
 use POSIX;
 use Time::HiRes qw();
 
-use lib qw(..);
+use lib qw(.. .);
 
-use PVE::API2::Qemu;
+use HTTP::Status qw(:constants);
+
+use PVE::API2::Qemu::Guest;
 use PVE::ProcFSTools;
 use PVE::QemuConfig;
 use PVE::QemuServer::Helpers;
 use PVE::RPCEnvironment;
 use PVE::UPID;
 
-my $VMID = 9005;
-my $USER = 'svc@pve!deploy';
+use GuestTestRequest;
+
+my $VMID = 100;
+my $OTHER_VMID = 101;
+my $OWNER_USER = 'erin@pve';
+my $EXEC_USER = 'erin@pve!exec';
+my $READ_USER = 'erin@pve!read';
+my $WRITE_USER = 'erin@pve!write';
 my $QEMU_GA = '/usr/sbin/qemu-ga';
 my $SOCKET_DIRECTORY = '/var/run/qemu-server';
 my $AGENT_START_SECONDS = 30;
 my $POLL_SECONDS = 60;
-my $EXEC_OUTPUT_LIMIT = 1024 * 1024;
-my $FILE_READ_LIMIT = 4 * 1024 * 1024;
+my $EXEC_TIMEOUT_ABOVE_MAXIMUM = 3601;
+my $EXEC_OUTPUT_LIMIT = PVE::API2::Qemu::Guest::exec_output_limit();
+my $FILE_READ_LIMIT = PVE::API2::Qemu::Guest::file_read_limit();
 
 my $vm_config = { agent => '1' };
 
@@ -97,25 +106,46 @@ END {
 }
 
 my $rpcenv = PVE::RPCEnvironment->init('priv');
-
-my $exec_info = PVE::API2::Qemu->map_method_by_name('exec');
-my $status_info = PVE::API2::Qemu->map_method_by_name('exec_status');
-my $write_info = PVE::API2::Qemu->map_method_by_name('file_write');
-my $read_info = PVE::API2::Qemu->map_method_by_name('file_read');
+$rpcenv->init_request(userconfig => 'guest-permission-test.cfg');
 
 my $test_start = time();
 my $started_count = 0;
 
+sub call_guest {
+    my ($user, $method, $vmid, $operation, $params) = @_;
+
+    my $response =
+        GuestTestRequest::guest_request($rpcenv, $user, $method, $vmid, $operation, $params);
+    die $response->{message} if $response->{status} != HTTP_OK;
+    return $response->{data};
+}
+
 sub call_exec {
     my ($param) = @_;
 
-    $rpcenv->set_credentials({ userid => $USER });
-    my $result = eval { $exec_info->{code}->({ vmid => $VMID, %$param }) };
-    my $error = $@;
-    $rpcenv->set_credentials(undef);
-    die $error if $error;
+    my $result = call_guest($EXEC_USER, 'POST', $VMID, 'exec', $param);
     $started_count++;
     return $result->{pid};
+}
+
+sub call_exec_status {
+    my ($user, $vmid, $pid) = @_;
+
+    return call_guest($user, 'GET', $vmid, 'exec-status', { pid => $pid });
+}
+
+sub call_file_write {
+    my ($file, $content) = @_;
+
+    return call_guest(
+        $WRITE_USER, 'POST', $VMID, 'file-write', { file => $file, content => $content },
+    );
+}
+
+sub call_file_read {
+    my ($file) = @_;
+
+    return call_guest($READ_USER, 'GET', $VMID, 'file-read', { file => $file });
 }
 
 sub wait_for_exit {
@@ -123,7 +153,7 @@ sub wait_for_exit {
 
     my $deadline = Time::HiRes::time() + $POLL_SECONDS;
     while (Time::HiRes::time() < $deadline) {
-        my $status = $status_info->{code}->({ vmid => $VMID, pid => $pid });
+        my $status = call_exec_status($EXEC_USER, $VMID, $pid);
         if ($status->{exited}) {
             $status->{stdout} = decode_base64($status->{'out-data'});
             $status->{stderr} = decode_base64($status->{'err-data'});
@@ -215,12 +245,14 @@ wait_for_exit($read_pid);
 check_dies(
     'exec-status rejects a second result read',
     qr/no stored result for command $read_pid in VM $VMID/,
-    sub { $status_info->{code}->({ vmid => $VMID, pid => $read_pid }) },
+    sub { call_exec_status($EXEC_USER, $VMID, $read_pid) },
 );
 check_dies(
     'exec-status rejects a pid from another VM',
-    qr/no stored result for command \d+ in VM 9006/,
-    sub { $status_info->{code}->({ vmid => 9006, pid => call_exec({ command => ['true'] }) }) },
+    qr/no stored result for command \d+ in VM $OTHER_VMID/,
+    sub {
+        call_exec_status($OWNER_USER, $OTHER_VMID, call_exec({ command => ['true'] }));
+    },
 );
 check_dies(
     'exec rejects invalid base64 input-data',
@@ -228,9 +260,9 @@ check_dies(
     sub { call_exec({ command => ['true'], 'input-data' => 'not base64!' }) },
 );
 check_dies(
-    'exec rejects missing request credentials',
-    qr/authenticated user of the request is not available/,
-    sub { $exec_info->{code}->({ vmid => $VMID, command => ['true'] }) },
+    'exec rejects a timeout above the schema maximum',
+    qr/Parameter verification failed/,
+    sub { call_exec({ command => ['true'], timeout => $EXEC_TIMEOUT_ABOVE_MAXIMUM }) },
 );
 check_dies(
     'exec-status reports a missing program',
@@ -240,10 +272,8 @@ check_dies(
 
 my $file_path = "$work_directory/written file";
 my $file_content = join('', map { chr($_) } 0 .. 255) x 16;
-$write_info->{code}->({
-    vmid => $VMID, file => $file_path, content => encode_base64($file_content, ''),
-});
-my $read_result = $read_info->{code}->({ vmid => $VMID, file => $file_path });
+call_file_write($file_path, encode_base64($file_content, ''));
+my $read_result = call_file_read($file_path);
 check_equal(
     'file-read returns the bytes written by file-write',
     $read_result->{content},
@@ -251,14 +281,14 @@ check_equal(
 );
 die "file-read marked a file below the read limit as truncated\n" if $read_result->{truncated};
 
-$write_info->{code}->({ vmid => $VMID, file => $file_path, content => encode_base64('new', '') });
-$read_result = $read_info->{code}->({ vmid => $VMID, file => $file_path });
+call_file_write($file_path, encode_base64('new', ''));
+$read_result = call_file_read($file_path);
 check_equal(
     'file-write replaces existing content', decode_base64($read_result->{content}), 'new',
 );
 
-$write_info->{code}->({ vmid => $VMID, file => $file_path, content => '' });
-$read_result = $read_info->{code}->({ vmid => $VMID, file => $file_path });
+call_file_write($file_path, '');
+$read_result = call_file_read($file_path);
 check_equal(
     'file-read returns empty content after an empty write', $read_result->{content}, '',
 );
@@ -269,7 +299,7 @@ open(my $large_handle, '>', $large_path)
     or die "unable to open $large_path for writing: $!\n";
 print {$large_handle} 'x' x ($FILE_READ_LIMIT + 1);
 close($large_handle) or die "unable to close $large_path: $!\n";
-$read_result = $read_info->{code}->({ vmid => $VMID, file => $large_path });
+$read_result = call_file_read($large_path);
 check_equal(
     'file-read returns four mebibytes from a larger file',
     length(decode_base64($read_result->{content})),
@@ -280,26 +310,22 @@ check_equal('truncated', $read_result->{truncated}, 1);
 check_dies(
     'file-read reports a missing file',
     qr/Agent error: /,
-    sub { $read_info->{code}->({ vmid => $VMID, file => "$work_directory/missing" }) },
+    sub { call_file_read("$work_directory/missing") },
 );
 check_dies(
     'file-write reports a missing parent directory',
     qr/Agent error: /,
-    sub {
-        $write_info->{code}->({
-            vmid => $VMID, file => "$work_directory/missing/file", content => 'bmV3',
-        });
-    },
+    sub { call_file_write("$work_directory/missing/file", 'bmV3') },
 );
 check_dies(
     'file-read rejects a relative path',
     qr/parameter 'file' must be an absolute path/,
-    sub { $read_info->{code}->({ vmid => $VMID, file => 'relative' }) },
+    sub { call_file_read('relative') },
 );
 check_dies(
     'file-write rejects invalid base64 content',
     qr/parameter 'content' is not valid base64/,
-    sub { $write_info->{code}->({ vmid => $VMID, file => $file_path, content => 'a' }) },
+    sub { call_file_write($file_path, 'a') },
 );
 
 my $task_count = 0;
@@ -307,17 +333,15 @@ for my $log (glob('/var/log/pve/tasks/*/UPID*')) {
     my $upid = PVE::UPID::decode(basename($log));
     next if !$upid || $upid->{type} ne 'qmexec' || $upid->{id} ne $VMID;
     next if $upid->{starttime} < $test_start;
-    die "qmexec task has unexpected user $upid->{user}\n" if $upid->{user} ne $USER;
+    die "qmexec task has unexpected user $upid->{user}\n" if $upid->{user} ne $EXEC_USER;
     $task_count++;
 }
 check_equal('qmexec task count matches returned pid count', $task_count, $started_count);
 
 my $guest_calls = {
     'exec' => sub { call_exec({ command => ['true'] }) },
-    'file-write' => sub {
-        $write_info->{code}->({ vmid => $VMID, file => $file_path, content => 'bmV3' });
-    },
-    'file-read' => sub { $read_info->{code}->({ vmid => $VMID, file => $file_path }) },
+    'file-write' => sub { call_file_write($file_path, 'bmV3') },
+    'file-read' => sub { call_file_read($file_path) },
 };
 
 stop_agent($agent_pid);
