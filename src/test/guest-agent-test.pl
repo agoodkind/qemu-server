@@ -416,6 +416,37 @@ sub check_completed_record_capacity {
     print "OK:acknowledgment releases completed-record capacity\n";
 }
 
+# Run interruption checks after operations that require the guest agent.
+sub check_worker_interruption {
+    my $interrupted_pid = call_exec({ command => ['sleep', '2'] });
+    my $worker_file = "/run/pve/qemu-exec/$VMID/$interrupted_pid/worker";
+    my $worker_deadline = Time::HiRes::time() + $POLL_SECONDS;
+    while (!-e $worker_file) {
+        die "the command worker did not register its process\n"
+            if Time::HiRes::time() >= $worker_deadline;
+        Time::HiRes::sleep(0.01);
+    }
+    my $worker_record = PVE::Tools::file_get_contents($worker_file);
+    die "the command worker record is invalid\n" if $worker_record !~ m/\A(\d+) \d+\z/;
+    my $worker_pid = $1;
+    kill('KILL', $worker_pid) or die "unable to interrupt the command worker: $!\n";
+    my $interrupted_deadline = Time::HiRes::time() + $POLL_SECONDS;
+    while (PVE::ProcFSTools::check_process_running($worker_pid)) {
+        die "the interrupted command worker did not stop\n"
+            if Time::HiRes::time() >= $interrupted_deadline;
+        Time::HiRes::sleep(0.01);
+    }
+    check_dies(
+        'exec-status reports an uncertain outcome after worker interruption',
+        qr/command outcome is uncertain after worker interruption; do not replay the command/,
+        sub { call_exec_status($EXEC_USER, $VMID, $interrupted_pid) },
+    );
+    my $expired_orphan = time() - 7201;
+    utime($expired_orphan, $expired_orphan, "/run/pve/qemu-exec/$VMID/$interrupted_pid")
+        or die "unable to expire the interrupted test result: $!\n";
+    call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $interrupted_pid });
+}
+
 my $input_status = run_command({
     command => ['sh', '-c', 'cat; echo problem >&2; exit 3'],
     'input-data' => encode_base64("first line\nsecond line\n", ''),
@@ -471,32 +502,6 @@ check_dies(
     qr/Parameter verification failed/,
     sub { call_exec({ command => ['true'], 'result-retention' => 'consumed' }) },
 );
-my $interrupted_pid = call_exec({ command => ['sleep', '2'] });
-my $worker_file = "/run/pve/qemu-exec/$VMID/$interrupted_pid/worker";
-my $worker_deadline = Time::HiRes::time() + $POLL_SECONDS;
-while (!-e $worker_file) {
-    die "the command worker did not register its process\n"
-        if Time::HiRes::time() >= $worker_deadline;
-    Time::HiRes::sleep(0.01);
-}
-my $worker_record = PVE::Tools::file_get_contents($worker_file);
-die "the command worker record is invalid\n" if $worker_record !~ m/\A(\d+) \d+\z/;
-my $worker_pid = $1;
-kill('KILL', $worker_pid) or die "unable to interrupt the command worker: $!\n";
-my $interrupted_deadline = Time::HiRes::time() + $POLL_SECONDS;
-while (PVE::ProcFSTools::check_process_running($worker_pid)) {
-    die "the interrupted command worker did not stop\n"
-        if Time::HiRes::time() >= $interrupted_deadline;
-    Time::HiRes::sleep(0.01);
-}
-check_dies(
-    'exec-status reports an uncertain outcome after worker interruption',
-    qr/command outcome is uncertain after worker interruption; do not replay the command/,
-    sub { call_exec_status($EXEC_USER, $VMID, $interrupted_pid) },
-);
-my $expired_orphan = time() - 7201;
-utime($expired_orphan, $expired_orphan, "/run/pve/qemu-exec/$VMID/$interrupted_pid")
-    or die "unable to expire the interrupted test result: $!\n";
 my @reserved_results;
 for (1 .. 128) {
     my $reserved_pid = eval { PVE::GuestExecResult::reserve('lxc', $OTHER_VMID) };
@@ -530,6 +535,7 @@ for my $pid (@started_pids) {
 }
 check_completed_record_capacity();
 if ($result_retention_only) {
+    check_worker_interruption();
     print "command result retention tests passed\n";
     exit(0);
 }
@@ -762,6 +768,8 @@ check_dies(
     qr/parameter 'content' is not valid base64/,
     sub { call_file_write($file_path, 'a') },
 );
+
+check_worker_interruption();
 
 my $task_count = 0;
 for my $log (glob('/var/log/pve/tasks/*/UPID*')) {
