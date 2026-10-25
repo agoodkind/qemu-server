@@ -28,6 +28,9 @@ use PVE::UPID;
 
 use GuestTestRequest;
 
+my $TEST_PROCESS_ID = $$;
+my $AGENT_DIAGNOSTIC_LIMIT = 8192;
+my $AGENT_DIAGNOSTIC_TIMEOUT = 3;
 my $result_retention_only = 0;
 GetOptions('result-retention' => \$result_retention_only)
     or die "invalid guest-agent-test option\n";
@@ -113,17 +116,93 @@ sub stop_agent {
     waitpid($pid, 0);
 }
 
+sub report_agent_failure {
+    my ($label, $pid, $directory) = @_;
+
+    my $reaped = 0;
+    eval {
+        my $info = PVE::ProcFSTools::read_proc_pid_stat($pid);
+        my $metadata = {
+            agent => $label,
+            pid => 0 + $pid,
+            owner_pid => 0 + $$,
+            socket_present => -S $socket_path ? 1 : 0,
+            signal_probe => 0 + kill(0, $pid),
+        };
+        if ($info) {
+            $metadata->{process_state} = $info->{status};
+            $metadata->{process_starttime} = $info->{starttime};
+        }
+        my $waited = waitpid($pid, WNOHANG);
+        my $status = $?;
+        $metadata->{waitpid} = 0 + $waited;
+        if ($waited == $pid) {
+            $reaped = 1;
+            $metadata->{exit_code} = $status >> 8;
+            $metadata->{signal} = $status & 127;
+        }
+        $metadata->{wait_error} = "$!" if $waited < 0;
+        print STDERR 'QGA process diagnostic: ', encode_json($metadata), "\n";
+    };
+    if (my $error = $@) {
+        print STDERR "QGA process diagnostic failed: ", substr($error, 0, $AGENT_DIAGNOSTIC_LIMIT);
+    }
+
+    eval {
+        PVE::QemuServer::Monitor::mon_cmd(
+            $VMID, 'guest-ping', timeout => $AGENT_DIAGNOSTIC_TIMEOUT,
+        );
+    };
+    if (my $error = $@) {
+        print STDERR "QGA ping diagnostic failed: ", substr($error, 0, $AGENT_DIAGNOSTIC_LIMIT);
+    } else {
+        print STDERR "QGA ping diagnostic succeeded\n";
+    }
+
+    eval {
+        my $log_file = "$directory/qemu-ga.log";
+        open(my $handle, '<', $log_file) or die "unable to read the QGA log: $!\n";
+        my $size = -s $handle;
+        die "unable to measure the QGA log: $!\n" if !defined($size);
+        my $offset = $size - $AGENT_DIAGNOSTIC_LIMIT;
+        $offset = 0 if $offset < 0;
+        seek($handle, $offset, SEEK_SET) or die "unable to seek in the QGA log: $!\n";
+        my $count = read($handle, my $log, $AGENT_DIAGNOSTIC_LIMIT);
+        die "unable to read the QGA log: $!\n" if !defined($count);
+        close($handle) or die "unable to close the QGA log: $!\n";
+        print STDERR "QGA log tail ($label, $count bytes):\n", $log, "\n";
+    };
+    if (my $error = $@) {
+        print STDERR "QGA log diagnostic failed: ", substr($error, 0, $AGENT_DIAGNOSTIC_LIMIT);
+    }
+    return $reaped;
+}
+
 my $agent_pid = start_agent($socket_path, $work_directory);
 my $frozen_agent_pid;
 END {
-    my $exit_status = $?;
-    stop_agent($agent_pid) if $agent_pid;
-    if ($frozen_agent_pid) {
-        # qemu-ga ignores SIGTERM while frozen.
-        kill('KILL', $frozen_agent_pid);
-        waitpid($frozen_agent_pid, 0);
+    if (defined($TEST_PROCESS_ID) && $$ == $TEST_PROCESS_ID) {
+        my $exit_status = $?;
+        if ($exit_status) {
+            if ($agent_pid) {
+                my $reaped = report_agent_failure('primary', $agent_pid, $work_directory);
+                $agent_pid = undef if $reaped;
+            }
+            if ($frozen_agent_pid) {
+                my $reaped = report_agent_failure(
+                    'frozen', $frozen_agent_pid, "$work_directory/frozen",
+                );
+                $frozen_agent_pid = undef if $reaped;
+            }
+        }
+        stop_agent($agent_pid) if $agent_pid;
+        if ($frozen_agent_pid) {
+            # qemu-ga ignores SIGTERM while frozen.
+            kill('KILL', $frozen_agent_pid);
+            waitpid($frozen_agent_pid, 0);
+        }
+        $? = $exit_status;
     }
-    $? = $exit_status;
 }
 
 my $rpcenv = PVE::RPCEnvironment->init('priv');
