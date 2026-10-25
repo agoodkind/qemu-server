@@ -22,30 +22,35 @@ my $guest_requests = {
         operation => 'exec',
         params => { command => ['true'] },
         privilege => 'VM.Guest.Exec',
+        expected_success_status => HTTP_INTERNAL_SERVER_ERROR,
     },
     exec_status => {
         method => 'GET',
         operation => 'exec-status',
         params => { pid => 1 },
         privilege => 'VM.Guest.Exec',
+        expected_success_status => HTTP_INTERNAL_SERVER_ERROR,
     },
     exec_ack => {
         method => 'POST',
         operation => 'exec-ack',
         params => { pid => 1 },
         privilege => 'VM.Guest.Exec',
+        expected_success_status => HTTP_OK,
     },
     file_write => {
         method => 'POST',
         operation => 'file-write',
         params => { file => '/tmp/guest-permission-test', content => '' },
         privilege => 'VM.Guest.FileWrite',
+        expected_success_status => HTTP_INTERNAL_SERVER_ERROR,
     },
     file_read => {
         method => 'GET',
         operation => 'file-read',
         params => { file => '/tmp/guest-permission-test' },
         privilege => 'VM.Guest.FileRead',
+        expected_success_status => HTTP_INTERNAL_SERVER_ERROR,
     },
 };
 
@@ -56,7 +61,6 @@ my $guest_tokens = {
     'erin@pve!write' => 'VM.Guest.FileWrite',
 };
 
-# The methods return status 500 after authorization in this test without VM configuration.
 sub request_is_authorized {
     my ($name, $user, $request_vmid) = @_;
 
@@ -72,8 +76,7 @@ sub request_is_authorized {
     my $status = $response->{status};
     my $message = $response->{message} // '';
 
-    return 1 if $status == HTTP_INTERNAL_SERVER_ERROR;
-    return 1 if $name eq 'exec_ack' && $status == HTTP_OK;
+    return 1 if $status == $request->{expected_success_status};
 
     my $privilege = $request->{privilege};
     return 0
