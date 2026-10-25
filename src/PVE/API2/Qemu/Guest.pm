@@ -3,9 +3,6 @@ package PVE::API2::Qemu::Guest;
 use strict;
 use warnings;
 
-use Fcntl qw(O_RDONLY);
-use File::Path qw(make_path remove_tree);
-use JSON;
 use MIME::Base64 qw(decode_base64 encode_base64);
 use POSIX qw(SIGCHLD SIG_BLOCK SIG_UNBLOCK SIG_SETMASK sigprocmask);
 use Time::HiRes qw();
@@ -15,6 +12,7 @@ use PVE::QemuConfig;
 use PVE::QemuServer;
 use PVE::QemuServer::Agent qw(agent_cmd);
 use PVE::RPCEnvironment;
+use PVE::GuestExecResult;
 use PVE::Tools;
 
 # pve-http-server rejects a request body above 512 KiB ($limit_max_post in
@@ -24,19 +22,13 @@ my $GUEST_BASE64_MAX_LENGTH = 128 * 1024;
 my $GUEST_BASE64_REGEX = qr{(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?};
 my $GUEST_EXEC_TIMEOUT_DEFAULT = 120;
 my $GUEST_EXEC_TIMEOUT_MAX = 3600;
-my $GUEST_EXEC_OUTPUT_LIMIT = 1024 * 1024;
+my $GUEST_EXEC_OUTPUT_LIMIT = PVE::GuestExecResult::output_limit();
 my $GUEST_FILE_READ_LIMIT = 4 * 1024 * 1024;
 my $GUEST_FILE_PATH_MAX_LENGTH = 4096;
 my $GUEST_FILE_READ_CHUNK_SIZE = 1024 * 1024;
 my $GUEST_KILL_GRACE_SECONDS = 5;
 my $GUEST_POLL_MIN_SECONDS = 0.05;
 my $GUEST_POLL_MAX_SECONDS = 1;
-my $GUEST_EXEC_RESULT_ROOT = '/run/pve/qemu-exec';
-my $GUEST_EXEC_RESULT_TTL = 3600;
-# A result directory without a status file is removed after the longest timeout plus the TTL.
-my $GUEST_EXEC_ORPHAN_TTL = $GUEST_EXEC_TIMEOUT_MAX + $GUEST_EXEC_RESULT_TTL;
-my $GUEST_EXEC_ID_BYTES = 6;
-my $GUEST_EXEC_ID_ATTEMPTS = 10;
 my $GUEST_EXEC_TIMEOUT_EXITCODE = 124;
 my $GUEST_SIGNAL_EXITCODE_BASE = 128;
 # qemu-ga disables guest-exec and guest-exec-status while guest filesystems are frozen.
@@ -215,99 +207,16 @@ my $run_in_vm = sub {
     return ($exitcode, $captured, $truncated, 0);
 };
 
-my $exec_directory = sub {
-    my ($vmid, $exec_id) = @_;
-
-    my $vmid_number = $untaint_decimal->('vmid', $vmid);
-    my $exec_number = $untaint_decimal->('pid', $exec_id);
-    return "$GUEST_EXEC_RESULT_ROOT/$vmid_number/$exec_number";
-};
-
-# Guest process IDs can repeat before exec-status reads a result.
-my $create_exec_directory = sub {
-    my ($vmid) = @_;
-
-    my $vmid_number = $untaint_decimal->('vmid', $vmid);
-    my $vmid_directory = "$GUEST_EXEC_RESULT_ROOT/$vmid_number";
-    for (1 .. $GUEST_EXEC_ID_ATTEMPTS) {
-        # The cleanup can remove an empty vmid directory between attempts. Each attempt creates
-        # the directory again.
-        make_path($vmid_directory, { mode => 0700 });
-        chmod(0700, $GUEST_EXEC_RESULT_ROOT, $vmid_directory);
-
-        sysopen(my $random_handle, '/dev/urandom', O_RDONLY)
-            or die "unable to open /dev/urandom: $!\n";
-        my $read_count = sysread($random_handle, my $random_bytes, $GUEST_EXEC_ID_BYTES);
-        close($random_handle);
-        die "unable to read /dev/urandom\n"
-            if !defined($read_count) || $read_count != $GUEST_EXEC_ID_BYTES;
-
-        # The bytes from /dev/urandom are tainted.
-        my $exec_id = $untaint_decimal->('pid', unpack('Q>', "\0\0" . $random_bytes));
-        next if $exec_id < 1;
-
-        my $directory = $exec_directory->($vmid_number, $exec_id);
-        if (mkdir($directory, 0700)) {
-            chmod(0700, $directory);
-            return $exec_id;
-        }
-        die "unable to create '$directory': $!\n" if !$!{EEXIST} && !$!{ENOENT};
-    }
-
-    die "unable to create an execution result directory for VM $vmid after 10 attempts\n";
-};
-
-# $remove_expired_exec_results deletes result directories after their retention limit.
-# A directory without a status file represents a running command or an interrupted worker.
-my $remove_expired_exec_results = sub {
-    my $root_handle;
-    return if !opendir($root_handle, $GUEST_EXEC_RESULT_ROOT);
-
-    my $now = time();
-    for my $vmid_name (readdir($root_handle)) {
-        next if $vmid_name !~ m/\A(\d+)\z/;
-        my $vmid_directory = "$GUEST_EXEC_RESULT_ROOT/$1";
-
-        my $vmid_handle;
-        next if !opendir($vmid_handle, $vmid_directory);
-        for my $id_name (readdir($vmid_handle)) {
-            next if $id_name !~ m/\A(\d+)\z/;
-            my $directory = "$vmid_directory/$1";
-
-            my $reference_time = (stat("$directory/status"))[9];
-            my $time_to_live = $GUEST_EXEC_RESULT_TTL;
-            if (!defined($reference_time)) {
-                $reference_time = (stat($directory))[9];
-                $time_to_live = $GUEST_EXEC_ORPHAN_TTL;
-            }
-            next if !defined($reference_time);
-
-            if ($now - $reference_time > $time_to_live) {
-                remove_tree($directory);
-            }
-        }
-        closedir($vmid_handle);
-        rmdir($vmid_directory); # fails while the directory contains a result
-    }
-    closedir($root_handle);
-};
-
-# $run_exec_worker writes stdout and stderr before the status file.
-# The status file marks a complete result.
 my $run_exec_worker = sub {
     my ($vmid, $exec_id, $command, $input, $timeout) = @_;
 
-    my $directory = $exec_directory->($vmid, $exec_id);
+    PVE::GuestExecResult::worker_started('qemu', $vmid, $exec_id);
     my $status = {};
+    my $captured = { stdout => '', stderr => '' };
     eval {
-        my ($exitcode, $captured, $truncated, $timed_out) =
+        my ($exitcode, $output, $truncated, $timed_out) =
             $run_in_vm->($vmid, $command, $input, $timeout, $GUEST_EXEC_OUTPUT_LIMIT);
-
-        PVE::Tools::file_set_contents("$directory/stdout", $captured->{stdout}, 0600);
-        PVE::Tools::file_set_contents("$directory/stderr", $captured->{stderr}, 0600);
-
-        # JSON encodes a number that Perl also used as a string, such as the exit code 124 in
-        # a message, as a JSON string. The addition returns a plain number.
+        $captured = $output;
         $status->{exitcode} = 0 + $exitcode;
         $status->{'out-truncated'} = 1 if $truncated->{stdout};
         $status->{'err-truncated'} = 1 if $truncated->{stderr};
@@ -318,37 +227,8 @@ my $run_exec_worker = sub {
         $status = { error => $error };
     }
 
-    PVE::Tools::file_set_contents("$directory/status", encode_json($status), 0600);
-
-    # The task ends with an error status after exec-status can read the result.
+    PVE::GuestExecResult::complete('qemu', $vmid, $exec_id, $status, $captured);
     die "command timed out after $timeout seconds\n" if $status->{'timed-out'};
-};
-
-my $read_exec_result = sub {
-    my ($vmid, $exec_id) = @_;
-
-    my $directory = $exec_directory->($vmid, $exec_id);
-    die "no stored result for command $exec_id in VM $vmid\n" if !-d $directory;
-    return { exited => 0 } if !-e "$directory/status";
-
-    my $status = decode_json(PVE::Tools::file_get_contents("$directory/status"));
-    my $result = { exited => 1 };
-    if (!defined($status->{error})) {
-        my $stdout = PVE::Tools::file_get_contents("$directory/stdout", $GUEST_EXEC_OUTPUT_LIMIT);
-        my $stderr = PVE::Tools::file_get_contents("$directory/stderr", $GUEST_EXEC_OUTPUT_LIMIT);
-        $result->{exitcode} = 0 + $status->{exitcode};
-        $result->{'out-data'} = encode_base64($stdout, '');
-        $result->{'err-data'} = encode_base64($stderr, '');
-        for my $flag ('out-truncated', 'err-truncated', 'timed-out') {
-            $result->{$flag} = 1 if $status->{$flag};
-        }
-    }
-    remove_tree($directory);
-
-    die "execution of command $exec_id in VM $vmid failed: $status->{error}\n"
-        if defined($status->{error});
-
-    return $result;
 };
 
 # The guest agent retains unclosed file handles until it restarts.
@@ -423,6 +303,13 @@ sub register_methods {
                     description => 'Seconds until the command is stopped.',
                     optional => 1,
                 },
+                'result-retention' => {
+                    type => 'string',
+                    enum => ['acknowledged'],
+                    default => 'acknowledged',
+                    optional => 1,
+                    description => 'Retain completed results until acknowledgment or expiry.',
+                },
             },
         },
         returns => {
@@ -458,8 +345,7 @@ sub register_methods {
             my $command = $untaint_command->($param->{command});
 
             $assert_guest_agent->($vmid);
-            $remove_expired_exec_results->();
-            my $exec_id = $create_exec_directory->($vmid);
+            my $exec_id = PVE::GuestExecResult::reserve('qemu', $vmid);
 
             # fork_worker waits for the worker with a read that a SIGCHLD from an earlier
             # worker interrupts, and then fails with "got no worker upid". SIGCHLD stays
@@ -496,8 +382,7 @@ sub register_methods {
         permissions => {
             check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
         },
-        description => 'Get the status of a command that exec started. The read of an exited'
-            . ' command deletes its stored result.',
+        description => 'Read a command result until exec-ack deletes it or one hour passes.',
         parameters => {
             additionalProperties => 0,
             properties => {
@@ -559,12 +444,45 @@ sub register_methods {
         code => sub {
             my ($param) = @_;
 
-            $remove_expired_exec_results->();
-
             my $vmid = $untaint_decimal->('vmid', $param->{vmid});
             my $exec_id = $untaint_decimal->('pid', $param->{pid});
 
-            return $read_exec_result->($vmid, $exec_id);
+            return PVE::GuestExecResult::read('qemu', $vmid, $exec_id);
+        },
+    });
+
+    $class->register_method({
+        name => 'exec_ack',
+        path => '{vmid}/exec-ack',
+        method => 'POST',
+        protected => 1,
+        proxyto => 'node',
+        permissions => {
+            check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
+        },
+        description => 'Acknowledge receipt and delete a completed command result.'
+            . ' Repeated acknowledgment succeeds.',
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                node => get_standard_option('pve-node'),
+                vmid => get_standard_option(
+                    'pve-vmid', { completion => \&PVE::QemuServer::complete_vmid_running },
+                ),
+                pid => {
+                    type => 'integer',
+                    minimum => 1,
+                    description => 'The identifier that exec returned.',
+                },
+            },
+        },
+        returns => { type => 'null' },
+        code => sub {
+            my ($param) = @_;
+
+            my $vmid = $untaint_decimal->('vmid', $param->{vmid});
+            my $exec_id = $untaint_decimal->('pid', $param->{pid});
+            return PVE::GuestExecResult::acknowledge('qemu', $vmid, $exec_id);
         },
     });
 

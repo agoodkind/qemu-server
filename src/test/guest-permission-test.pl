@@ -29,6 +29,12 @@ my $guest_requests = {
         params => { pid => 1 },
         privilege => 'VM.Guest.Exec',
     },
+    exec_ack => {
+        method => 'POST',
+        operation => 'exec-ack',
+        params => { pid => 1 },
+        privilege => 'VM.Guest.Exec',
+    },
     file_write => {
         method => 'POST',
         operation => 'file-write',
@@ -67,6 +73,7 @@ sub request_is_authorized {
     my $message = $response->{message} // '';
 
     return 1 if $status == HTTP_INTERNAL_SERVER_ERROR;
+    return 1 if $name eq 'exec_ack' && $status == HTTP_OK;
 
     my $privilege = $request->{privilege};
     return 0

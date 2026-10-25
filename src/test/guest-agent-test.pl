@@ -8,6 +8,7 @@ use warnings;
 use File::Basename qw(basename);
 use File::Path qw(make_path);
 use File::Temp qw(tempdir);
+use Getopt::Long qw(GetOptions);
 use MIME::Base64 qw(decode_base64 encode_base64);
 use POSIX;
 use Time::HiRes qw();
@@ -26,6 +27,10 @@ use PVE::UPID;
 
 use GuestTestRequest;
 
+my $result_retention_only = 0;
+GetOptions('result-retention' => \$result_retention_only)
+    or die "invalid guest-agent-test option\n";
+
 my $VMID = 100;
 my $OTHER_VMID = 101;
 my $OWNER_USER = 'erin@pve';
@@ -43,12 +48,18 @@ my $EXEC_OUTPUT_LIMIT = PVE::API2::Qemu::Guest::exec_output_limit();
 my $FILE_READ_LIMIT = PVE::API2::Qemu::Guest::file_read_limit();
 
 my $vm_config = { agent => '1' };
+my $read_proc_starttime = \&PVE::ProcFSTools::read_proc_starttime;
 
 {
     no warnings qw(redefine once);
     *PVE::QemuConfig::load_config = sub { return $vm_config };
     *PVE::QemuServer::Helpers::vm_running_locally = sub { return 1 };
-    *PVE::ProcFSTools::read_proc_starttime = sub { return 1 };
+    # The amd64 emulator reports different worker start times during fork_worker.
+    # Result storage reads the actual process information.
+    *PVE::ProcFSTools::read_proc_starttime = sub {
+        return 1 if caller eq 'PVE::RESTEnvironment';
+        return $read_proc_starttime->(@_);
+    };
 }
 
 # The UTF-8 layer prevents Wide character in print warnings for non-ASCII qemu-ga errors.
@@ -221,6 +232,94 @@ check_equal(
 my $signal_status = run_command({ command => ['sh', '-c', 'kill -KILL $$'] });
 check_equal('exec-status returns exit code 137 after KILL', $signal_status->{exitcode}, 128 + 9);
 
+my $read_pid = call_exec({ command => ['head', '-c', '65536', '/dev/zero'] });
+my $first_result = wait_for_exit($read_pid);
+my $second_result = call_exec_status($EXEC_USER, $VMID, $read_pid);
+check_equal('exec-status repeats the completed exit code', $second_result->{exitcode}, $first_result->{exitcode});
+check_equal('exec-status repeats standard output', $second_result->{'out-data'}, $first_result->{'out-data'});
+check_equal('exec-status repeats standard error', $second_result->{'err-data'}, $first_result->{'err-data'});
+call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $read_pid });
+call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $read_pid });
+check_dies(
+    'exec-status rejects a result after acknowledgment',
+    qr/no stored result for command $read_pid in VM $VMID/,
+    sub { call_exec_status($EXEC_USER, $VMID, $read_pid) },
+);
+my $expiry_pid = call_exec({
+    command => ['true'],
+    'result-retention' => 'acknowledged',
+});
+wait_for_exit($expiry_pid);
+my $expired_time = time() - 3601;
+utime($expired_time, $expired_time, "/run/pve/qemu-exec/$VMID/$expiry_pid/status")
+    or die "unable to expire the completed test result: $!\n";
+check_dies(
+    'exec-status expires a completed result after one hour',
+    qr/no stored result for command $expiry_pid in VM $VMID/,
+    sub { call_exec_status($EXEC_USER, $VMID, $expiry_pid) },
+);
+call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $expiry_pid });
+check_dies(
+    'exec rejects a consuming result contract',
+    qr/Parameter verification failed/,
+    sub { call_exec({ command => ['true'], 'result-retention' => 'consumed' }) },
+);
+my $interrupted_pid = call_exec({ command => ['sleep', '2'] });
+my $worker_file = "/run/pve/qemu-exec/$VMID/$interrupted_pid/worker";
+my $worker_deadline = Time::HiRes::time() + $POLL_SECONDS;
+while (!-e $worker_file) {
+    die "the command worker did not register its process\n"
+        if Time::HiRes::time() >= $worker_deadline;
+    Time::HiRes::sleep(0.01);
+}
+my $worker_record = PVE::Tools::file_get_contents($worker_file);
+die "the command worker record is invalid\n" if $worker_record !~ m/\A(\d+) \d+\z/;
+my $worker_pid = $1;
+kill('KILL', $worker_pid) or die "unable to interrupt the command worker: $!\n";
+my $interrupted_deadline = Time::HiRes::time() + $POLL_SECONDS;
+while (PVE::ProcFSTools::check_process_running($worker_pid)) {
+    die "the interrupted command worker did not stop\n"
+        if Time::HiRes::time() >= $interrupted_deadline;
+    Time::HiRes::sleep(0.01);
+}
+check_dies(
+    'exec-status reports an uncertain outcome after worker interruption',
+    qr/command outcome is uncertain after worker interruption; do not replay the command/,
+    sub { call_exec_status($EXEC_USER, $VMID, $interrupted_pid) },
+);
+my @reserved_results;
+for (1 .. 128) {
+    my $reserved_pid = eval { PVE::GuestExecResult::reserve('lxc', $OTHER_VMID) };
+    if (my $error = $@) {
+        die $error if $error !~ m/command result storage capacity is full/;
+        last;
+    }
+    push @reserved_results, $reserved_pid;
+}
+die "the host did not reserve result capacity\n" if !@reserved_results;
+my $capacity_marker = "$work_directory/capacity-command";
+check_dies(
+    'LXC reservations refuse QEMU execution before the command starts',
+    qr/command result storage capacity is full/,
+    sub { call_exec({ command => ['mkdir', $capacity_marker] }) },
+);
+die "the capacity refusal started the guest command\n" if -e $capacity_marker;
+my $expired_reservation = time() - 7201;
+for my $reserved_pid (@reserved_results) {
+    utime(
+        $expired_reservation, $expired_reservation,
+        "/run/pve/lxc-exec/$OTHER_VMID/$reserved_pid",
+    ) or die "unable to expire the test reservation: $!\n";
+}
+my $after_expiry_pid = call_exec({ command => ['mkdir', $capacity_marker] });
+wait_for_exit($after_expiry_pid);
+die "expired reservations did not release command capacity\n" if !-e $capacity_marker;
+call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $after_expiry_pid });
+if ($result_retention_only) {
+    print "command result retention tests passed\n";
+    exit(0);
+}
+
 my $large_status = run_command({
     command => ['head', '-c', $EXEC_OUTPUT_LIMIT + 1, '/dev/zero'],
 });
@@ -249,13 +348,6 @@ die "process $command_pid still exists after exec-status returned the timeout re
     if kill(0, $command_pid);
 print "OK:timeout stops the command process\n";
 
-my $read_pid = call_exec({ command => ['true'] });
-wait_for_exit($read_pid);
-check_dies(
-    'exec-status rejects a second result read',
-    qr/no stored result for command $read_pid in VM $VMID/,
-    sub { call_exec_status($EXEC_USER, $VMID, $read_pid) },
-);
 check_dies(
     'exec-status rejects a pid from another VM',
     qr/no stored result for command \d+ in VM $OTHER_VMID/,
