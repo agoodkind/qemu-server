@@ -224,46 +224,46 @@ sub check_concurrent_result_ack {
     pipe(my $ready_reader, my $ready_writer) or die "ready pipe failed: $!\n";
     pipe(my $start_reader, my $start_writer) or die "start pipe failed: $!\n";
     my @readers;
-    for (1 .. $reader_count) {
-        my $reader_pid = fork() // die "reader fork failed: $!\n";
-        if (!$reader_pid) {
-            close($ready_reader);
-            close($start_writer);
-            my $success = eval {
-                my $initial = call_exec_status($EXEC_USER, $VMID, $pid);
-                die "a concurrent reader did not receive the complete original result\n"
-                    if $encoder->encode($initial) ne $expected_document;
-                die "reader readiness failed: $!\n" if syswrite($ready_writer, '1') != 1;
-                die "reader start failed: $!\n" if sysread($start_reader, my $start, 1) != 1;
-                for (1 .. $reads_per_process) {
-                    my $response = GuestTestRequest::guest_request(
-                        $rpcenv, $EXEC_USER, 'GET', $VMID, 'exec-status', { pid => $pid },
-                    );
-                    if ($response->{status} == HTTP_OK) {
-                        die "a concurrent reader received a partial or different result\n"
-                            if $encoder->encode($response->{data}) ne $expected_document;
-                    } else {
-                        my $message = $response->{message};
-                        die "a concurrent reader received an unexpected error\n"
-                            if $response->{status} != HTTP_INTERNAL_SERVER_ERROR
-                            || !defined($message)
-                            || $message !~ m/\Ano stored result for command $pid in VM $VMID\n?\z/;
-                    }
-                }
-                1;
-            };
-            print STDERR $@ if !$success;
-            POSIX::_exit($success ? 0 : 1);
-        }
-        push @readers, $reader_pid;
-    }
-    close($ready_writer);
-    close($start_reader);
     my $error;
     {
         local $SIG{ALRM} = sub { die "concurrent result reads exceeded 20 seconds\n" };
         alarm(20);
         eval {
+            for (1 .. $reader_count) {
+                my $reader_pid = fork() // die "reader fork failed: $!\n";
+                if (!$reader_pid) {
+                    close($ready_reader);
+                    close($start_writer);
+                    my $success = eval {
+                        my $initial = call_exec_status($EXEC_USER, $VMID, $pid);
+                        die "a concurrent reader did not receive the complete original result\n"
+                            if $encoder->encode($initial) ne $expected_document;
+                        die "reader readiness failed: $!\n" if syswrite($ready_writer, '1') != 1;
+                        die "reader start failed: $!\n" if sysread($start_reader, my $start, 1) != 1;
+                        for (1 .. $reads_per_process) {
+                            my $response = GuestTestRequest::guest_request(
+                                $rpcenv, $EXEC_USER, 'GET', $VMID, 'exec-status', { pid => $pid },
+                            );
+                            if ($response->{status} == HTTP_OK) {
+                                die "a concurrent reader received a partial or different result\n"
+                                    if $encoder->encode($response->{data}) ne $expected_document;
+                            } else {
+                                my $message = $response->{message};
+                                die "a concurrent reader received an unexpected error\n"
+                                    if $response->{status} != HTTP_INTERNAL_SERVER_ERROR
+                                    || !defined($message)
+                                    || $message !~ m/\Ano stored result for command $pid in VM $VMID\n?\z/;
+                            }
+                        }
+                        1;
+                    };
+                    print STDERR $@ if !$success;
+                    POSIX::_exit($success ? 0 : 1);
+                }
+                push @readers, $reader_pid;
+            }
+            close($ready_writer);
+            close($start_reader);
             my $ready_count = 0;
             while ($ready_count < $reader_count) {
                 my $count = sysread($ready_reader, my $ready, $reader_count - $ready_count);
@@ -274,21 +274,26 @@ sub check_concurrent_result_ack {
             die "unable to start concurrent readers: $!\n"
                 if syswrite($start_writer, '1' x $reader_count) != $reader_count;
             call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $pid });
-            for my $reader_pid (@readers) {
+            while (@readers) {
+                my $reader_pid = $readers[0];
+                my $waited = waitpid($reader_pid, 0);
+                my $exit_status = $?;
+                shift @readers if $waited == $reader_pid;
                 die "a concurrent result reader failed\n"
-                    if waitpid($reader_pid, 0) != $reader_pid || $? != 0;
+                    if $waited != $reader_pid || $exit_status != 0;
             }
         };
         $error = $@;
         alarm(0);
     }
-    close($ready_reader);
-    close($start_writer);
     if ($error) {
-        kill('KILL', @readers);
+        kill('KILL', @readers) if @readers;
         waitpid($_, 0) for @readers;
-        die $error;
     }
+    for my $handle ($ready_reader, $ready_writer, $start_reader, $start_writer) {
+        close($handle) if defined(fileno($handle));
+    }
+    die $error if $error;
     print "OK:concurrent read and acknowledgment preserve complete results\n";
 }
 
