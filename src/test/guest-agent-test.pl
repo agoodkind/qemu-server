@@ -91,6 +91,7 @@ sub start_agent {
     if (!$pid) {
         exec {$QEMU_GA} (
             $QEMU_GA,
+            '--verbose',
             '--method', 'unix-listen',
             '--path', $socket_path,
             '--statedir', $state_directory,
