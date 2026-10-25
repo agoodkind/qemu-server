@@ -1684,6 +1684,7 @@ __PACKAGE__->register_method({
             { subdir => 'remote_migrate' },
             { subdir => 'exec' },
             { subdir => 'exec-status' },
+            { subdir => 'exec-ack' },
             { subdir => 'file-read' },
             { subdir => 'file-write' },
         ];

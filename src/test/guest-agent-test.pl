@@ -8,6 +8,8 @@ use warnings;
 use File::Basename qw(basename);
 use File::Path qw(make_path);
 use File::Temp qw(tempdir);
+use Getopt::Long qw(GetOptions);
+use JSON;
 use MIME::Base64 qw(decode_base64 encode_base64);
 use POSIX;
 use Time::HiRes qw();
@@ -26,6 +28,13 @@ use PVE::UPID;
 
 use GuestTestRequest;
 
+my $TEST_PROCESS_ID = $$;
+my $AGENT_DIAGNOSTIC_LIMIT = 8192;
+my $AGENT_DIAGNOSTIC_TIMEOUT = 3;
+my $result_retention_only = 0;
+GetOptions('result-retention' => \$result_retention_only)
+    or die "invalid guest-agent-test option\n";
+
 my $VMID = 100;
 my $OTHER_VMID = 101;
 my $OWNER_USER = 'erin@pve';
@@ -43,12 +52,18 @@ my $EXEC_OUTPUT_LIMIT = PVE::API2::Qemu::Guest::exec_output_limit();
 my $FILE_READ_LIMIT = PVE::API2::Qemu::Guest::file_read_limit();
 
 my $vm_config = { agent => '1' };
+my $read_proc_starttime = \&PVE::ProcFSTools::read_proc_starttime;
 
 {
     no warnings qw(redefine once);
     *PVE::QemuConfig::load_config = sub { return $vm_config };
     *PVE::QemuServer::Helpers::vm_running_locally = sub { return 1 };
-    *PVE::ProcFSTools::read_proc_starttime = sub { return 1 };
+    # The amd64 emulator reports different worker start times during fork_worker.
+    # Result storage reads the actual process information.
+    *PVE::ProcFSTools::read_proc_starttime = sub {
+        return 1 if caller eq 'PVE::RESTEnvironment';
+        return $read_proc_starttime->(@_);
+    };
 }
 
 # The UTF-8 layer prevents Wide character in print warnings for non-ASCII qemu-ga errors.
@@ -76,6 +91,7 @@ sub start_agent {
     if (!$pid) {
         exec {$QEMU_GA} (
             $QEMU_GA,
+            '--verbose',
             '--method', 'unix-listen',
             '--path', $socket_path,
             '--statedir', $state_directory,
@@ -101,17 +117,93 @@ sub stop_agent {
     waitpid($pid, 0);
 }
 
+sub report_agent_failure {
+    my ($label, $pid, $directory) = @_;
+
+    my $reaped = 0;
+    eval {
+        my $info = PVE::ProcFSTools::read_proc_pid_stat($pid);
+        my $metadata = {
+            agent => $label,
+            pid => 0 + $pid,
+            owner_pid => 0 + $$,
+            socket_present => -S $socket_path ? 1 : 0,
+            signal_probe => 0 + kill(0, $pid),
+        };
+        if ($info) {
+            $metadata->{process_state} = $info->{status};
+            $metadata->{process_starttime} = $info->{starttime};
+        }
+        my $waited = waitpid($pid, WNOHANG);
+        my $status = $?;
+        $metadata->{waitpid} = 0 + $waited;
+        if ($waited == $pid) {
+            $reaped = 1;
+            $metadata->{exit_code} = $status >> 8;
+            $metadata->{signal} = $status & 127;
+        }
+        $metadata->{wait_error} = "$!" if $waited < 0;
+        print STDERR 'QGA process diagnostic: ', encode_json($metadata), "\n";
+    };
+    if (my $error = $@) {
+        print STDERR "QGA process diagnostic failed: ", substr($error, 0, $AGENT_DIAGNOSTIC_LIMIT);
+    }
+
+    eval {
+        PVE::QemuServer::Monitor::mon_cmd(
+            $VMID, 'guest-ping', timeout => $AGENT_DIAGNOSTIC_TIMEOUT,
+        );
+    };
+    if (my $error = $@) {
+        print STDERR "QGA ping diagnostic failed: ", substr($error, 0, $AGENT_DIAGNOSTIC_LIMIT);
+    } else {
+        print STDERR "QGA ping diagnostic succeeded\n";
+    }
+
+    eval {
+        my $log_file = "$directory/qemu-ga.log";
+        open(my $handle, '<', $log_file) or die "unable to read the QGA log: $!\n";
+        my $size = -s $handle;
+        die "unable to measure the QGA log: $!\n" if !defined($size);
+        my $offset = $size - $AGENT_DIAGNOSTIC_LIMIT;
+        $offset = 0 if $offset < 0;
+        seek($handle, $offset, SEEK_SET) or die "unable to seek in the QGA log: $!\n";
+        my $count = read($handle, my $log, $AGENT_DIAGNOSTIC_LIMIT);
+        die "unable to read the QGA log: $!\n" if !defined($count);
+        close($handle) or die "unable to close the QGA log: $!\n";
+        print STDERR "QGA log tail ($label, $count bytes):\n", $log, "\n";
+    };
+    if (my $error = $@) {
+        print STDERR "QGA log diagnostic failed: ", substr($error, 0, $AGENT_DIAGNOSTIC_LIMIT);
+    }
+    return $reaped;
+}
+
 my $agent_pid = start_agent($socket_path, $work_directory);
 my $frozen_agent_pid;
 END {
-    my $exit_status = $?;
-    stop_agent($agent_pid) if $agent_pid;
-    if ($frozen_agent_pid) {
-        # qemu-ga ignores SIGTERM while frozen.
-        kill('KILL', $frozen_agent_pid);
-        waitpid($frozen_agent_pid, 0);
+    if (defined($TEST_PROCESS_ID) && $$ == $TEST_PROCESS_ID) {
+        my $exit_status = $?;
+        if ($exit_status) {
+            if ($agent_pid) {
+                my $reaped = report_agent_failure('primary', $agent_pid, $work_directory);
+                $agent_pid = undef if $reaped;
+            }
+            if ($frozen_agent_pid) {
+                my $reaped = report_agent_failure(
+                    'frozen', $frozen_agent_pid, "$work_directory/frozen",
+                );
+                $frozen_agent_pid = undef if $reaped;
+            }
+        }
+        stop_agent($agent_pid) if $agent_pid;
+        if ($frozen_agent_pid) {
+            # qemu-ga ignores SIGTERM while frozen.
+            kill('KILL', $frozen_agent_pid);
+            waitpid($frozen_agent_pid, 0);
+        }
+        $? = $exit_status;
     }
-    $? = $exit_status;
 }
 
 my $rpcenv = PVE::RPCEnvironment->init('priv');
@@ -119,6 +211,7 @@ $rpcenv->init_request(userconfig => 'guest-permission-test.cfg');
 
 my $test_start = time();
 my $started_count = 0;
+my @started_pids;
 
 sub call_guest {
     my ($user, $method, $vmid, $operation, $params) = @_;
@@ -134,6 +227,7 @@ sub call_exec {
 
     my $result = call_guest($EXEC_USER, 'POST', $VMID, 'exec', $param);
     $started_count++;
+    push @started_pids, $result->{pid};
     return $result->{pid};
 }
 
@@ -198,6 +292,161 @@ sub check_dies {
     print "OK:$label:$error";
 }
 
+sub check_concurrent_result_ack {
+    my ($pid, $original) = @_;
+
+    my %expected = %$original;
+    delete @expected{qw(stdout stderr)};
+    my $encoder = JSON->new->canonical();
+    my $expected_document = $encoder->encode(\%expected);
+    my $reader_count = 4;
+    my $reads_per_process = 8;
+    pipe(my $ready_reader, my $ready_writer) or die "ready pipe failed: $!\n";
+    pipe(my $start_reader, my $start_writer) or die "start pipe failed: $!\n";
+    my @readers;
+    my $error;
+    {
+        local $SIG{ALRM} = sub { die "concurrent result reads exceeded 20 seconds\n" };
+        alarm(20);
+        eval {
+            for (1 .. $reader_count) {
+                my $reader_pid = fork() // die "reader fork failed: $!\n";
+                if (!$reader_pid) {
+                    close($ready_reader);
+                    close($start_writer);
+                    my $success = eval {
+                        my $initial = call_exec_status($EXEC_USER, $VMID, $pid);
+                        die "a concurrent reader did not receive the complete original result\n"
+                            if $encoder->encode($initial) ne $expected_document;
+                        die "reader readiness failed: $!\n" if syswrite($ready_writer, '1') != 1;
+                        die "reader start failed: $!\n" if sysread($start_reader, my $start, 1) != 1;
+                        for (1 .. $reads_per_process) {
+                            my $response = GuestTestRequest::guest_request(
+                                $rpcenv, $EXEC_USER, 'GET', $VMID, 'exec-status', { pid => $pid },
+                            );
+                            if ($response->{status} == HTTP_OK) {
+                                die "a concurrent reader received a partial or different result\n"
+                                    if $encoder->encode($response->{data}) ne $expected_document;
+                            } else {
+                                my $message = $response->{message};
+                                die "a concurrent reader received an unexpected error\n"
+                                    if $response->{status} != HTTP_INTERNAL_SERVER_ERROR
+                                    || !defined($message)
+                                    || $message !~ m/\Ano stored result for command $pid in VM $VMID\n?\z/;
+                            }
+                        }
+                        1;
+                    };
+                    print STDERR $@ if !$success;
+                    POSIX::_exit($success ? 0 : 1);
+                }
+                push @readers, $reader_pid;
+            }
+            close($ready_writer);
+            close($start_reader);
+            my $ready_count = 0;
+            while ($ready_count < $reader_count) {
+                my $count = sysread($ready_reader, my $ready, $reader_count - $ready_count);
+                die "a concurrent reader stopped before its start signal\n"
+                    if !defined($count) || $count == 0;
+                $ready_count += $count;
+            }
+            die "unable to start concurrent readers: $!\n"
+                if syswrite($start_writer, '1' x $reader_count) != $reader_count;
+            call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $pid });
+            while (@readers) {
+                my $reader_pid = $readers[0];
+                my $waited = waitpid($reader_pid, 0);
+                my $exit_status = $?;
+                shift @readers if $waited == $reader_pid;
+                die "a concurrent result reader failed\n"
+                    if $waited != $reader_pid || $exit_status != 0;
+            }
+        };
+        $error = $@;
+        alarm(0);
+    }
+    if ($error) {
+        kill('KILL', @readers) if @readers;
+        waitpid($_, 0) for @readers;
+    }
+    for my $handle ($ready_reader, $ready_writer, $start_reader, $start_writer) {
+        close($handle) if defined(fileno($handle));
+    }
+    die $error if $error;
+    print "OK:concurrent read and acknowledgment preserve complete results\n";
+}
+
+sub check_completed_record_capacity {
+    my @completed_records;
+    my $error;
+    eval {
+        for my $index (0 .. 1023) {
+            my ($kind, $vmid) = ('lxc', $OTHER_VMID);
+            if ($index % 2) {
+                ($kind, $vmid) = ('qemu', $VMID);
+            }
+            my $pid = PVE::GuestExecResult::reserve($kind, $vmid);
+            push @completed_records, { kind => $kind, vmid => $vmid, pid => $pid };
+            PVE::GuestExecResult::complete(
+                $kind, $vmid, $pid, { exitcode => 0 }, { stdout => '', stderr => '' },
+            );
+        }
+        my $marker = "$work_directory/completed-record-command";
+        check_dies(
+            '1024 completed records across both guest kinds refuse execution',
+            qr/command result storage capacity is full/,
+            sub { call_exec({ command => ['mkdir', $marker] }) },
+        );
+        die "the completed-record refusal started the guest command\n" if -e $marker;
+        my $released = shift @completed_records;
+        PVE::GuestExecResult::acknowledge(
+            $released->{kind}, $released->{vmid}, $released->{pid},
+        );
+        my $pid = call_exec({ command => ['mkdir', $marker] });
+        wait_for_exit($pid);
+        die "acknowledgment did not release one result record\n" if !-d $marker;
+        call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $pid });
+    };
+    $error = $@;
+    for my $record (@completed_records) {
+        PVE::GuestExecResult::acknowledge($record->{kind}, $record->{vmid}, $record->{pid});
+    }
+    die $error if $error;
+    print "OK:acknowledgment releases completed-record capacity\n";
+}
+
+# Run interruption checks after operations that require the guest agent.
+sub check_worker_interruption {
+    my $interrupted_pid = call_exec({ command => ['sleep', '2'] });
+    my $worker_file = "/run/pve/qemu-exec/$VMID/$interrupted_pid/worker";
+    my $worker_deadline = Time::HiRes::time() + $POLL_SECONDS;
+    while (!-e $worker_file) {
+        die "the command worker did not register its process\n"
+            if Time::HiRes::time() >= $worker_deadline;
+        Time::HiRes::sleep(0.01);
+    }
+    my $worker_record = PVE::Tools::file_get_contents($worker_file);
+    die "the command worker record is invalid\n" if $worker_record !~ m/\A(\d+) \d+\z/;
+    my $worker_pid = $1;
+    kill('KILL', $worker_pid) or die "unable to interrupt the command worker: $!\n";
+    my $interrupted_deadline = Time::HiRes::time() + $POLL_SECONDS;
+    while (PVE::ProcFSTools::check_process_running($worker_pid)) {
+        die "the interrupted command worker did not stop\n"
+            if Time::HiRes::time() >= $interrupted_deadline;
+        Time::HiRes::sleep(0.01);
+    }
+    check_dies(
+        'exec-status reports an uncertain outcome after worker interruption',
+        qr/command outcome is uncertain after worker interruption; do not replay the command/,
+        sub { call_exec_status($EXEC_USER, $VMID, $interrupted_pid) },
+    );
+    my $expired_orphan = time() - 7201;
+    utime($expired_orphan, $expired_orphan, "/run/pve/qemu-exec/$VMID/$interrupted_pid")
+        or die "unable to expire the interrupted test result: $!\n";
+    call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $interrupted_pid });
+}
+
 my $input_status = run_command({
     command => ['sh', '-c', 'cat; echo problem >&2; exit 3'],
     'input-data' => encode_base64("first line\nsecond line\n", ''),
@@ -220,6 +469,76 @@ check_equal(
 
 my $signal_status = run_command({ command => ['sh', '-c', 'kill -KILL $$'] });
 check_equal('exec-status returns exit code 137 after KILL', $signal_status->{exitcode}, 128 + 9);
+
+my $read_pid = call_exec({ command => ['head', '-c', '65536', '/dev/zero'] });
+my $first_result = wait_for_exit($read_pid);
+my $second_result = call_exec_status($EXEC_USER, $VMID, $read_pid);
+check_equal('exec-status repeats the completed exit code', $second_result->{exitcode}, $first_result->{exitcode});
+check_equal('exec-status repeats standard output', $second_result->{'out-data'}, $first_result->{'out-data'});
+check_equal('exec-status repeats standard error', $second_result->{'err-data'}, $first_result->{'err-data'});
+check_concurrent_result_ack($read_pid, $first_result);
+call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $read_pid });
+check_dies(
+    'exec-status rejects a result after acknowledgment',
+    qr/no stored result for command $read_pid in VM $VMID/,
+    sub { call_exec_status($EXEC_USER, $VMID, $read_pid) },
+);
+my $expiry_pid = call_exec({
+    command => ['true'],
+    'result-retention' => 'acknowledged',
+});
+wait_for_exit($expiry_pid);
+my $expired_time = time() - 3601;
+utime($expired_time, $expired_time, "/run/pve/qemu-exec/$VMID/$expiry_pid/status")
+    or die "unable to expire the completed test result: $!\n";
+check_dies(
+    'exec-status expires a completed result after one hour',
+    qr/no stored result for command $expiry_pid in VM $VMID/,
+    sub { call_exec_status($EXEC_USER, $VMID, $expiry_pid) },
+);
+call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $expiry_pid });
+check_dies(
+    'exec rejects a consuming result contract',
+    qr/Parameter verification failed/,
+    sub { call_exec({ command => ['true'], 'result-retention' => 'consumed' }) },
+);
+my @reserved_results;
+for (1 .. 128) {
+    my $reserved_pid = eval { PVE::GuestExecResult::reserve('lxc', $OTHER_VMID) };
+    if (my $error = $@) {
+        die $error if $error !~ m/command result storage capacity is full/;
+        last;
+    }
+    push @reserved_results, $reserved_pid;
+}
+die "the host did not reserve result capacity\n" if !@reserved_results;
+my $capacity_marker = "$work_directory/capacity-command";
+check_dies(
+    'LXC reservations refuse QEMU execution before the command starts',
+    qr/command result storage capacity is full/,
+    sub { call_exec({ command => ['mkdir', $capacity_marker] }) },
+);
+die "the capacity refusal started the guest command\n" if -e $capacity_marker;
+my $expired_reservation = time() - 7201;
+for my $reserved_pid (@reserved_results) {
+    utime(
+        $expired_reservation, $expired_reservation,
+        "/run/pve/lxc-exec/$OTHER_VMID/$reserved_pid",
+    ) or die "unable to expire the test reservation: $!\n";
+}
+my $after_expiry_pid = call_exec({ command => ['mkdir', $capacity_marker] });
+wait_for_exit($after_expiry_pid);
+die "expired reservations did not release command capacity\n" if !-e $capacity_marker;
+call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $after_expiry_pid });
+for my $pid (@started_pids) {
+    call_guest($EXEC_USER, 'POST', $VMID, 'exec-ack', { pid => $pid });
+}
+check_completed_record_capacity();
+if ($result_retention_only) {
+    check_worker_interruption();
+    print "command result retention tests passed\n";
+    exit(0);
+}
 
 my $large_status = run_command({
     command => ['head', '-c', $EXEC_OUTPUT_LIMIT + 1, '/dev/zero'],
@@ -249,13 +568,6 @@ die "process $command_pid still exists after exec-status returned the timeout re
     if kill(0, $command_pid);
 print "OK:timeout stops the command process\n";
 
-my $read_pid = call_exec({ command => ['true'] });
-wait_for_exit($read_pid);
-check_dies(
-    'exec-status rejects a second result read',
-    qr/no stored result for command $read_pid in VM $VMID/,
-    sub { call_exec_status($EXEC_USER, $VMID, $read_pid) },
-);
 check_dies(
     'exec-status rejects a pid from another VM',
     qr/no stored result for command \d+ in VM $OTHER_VMID/,
@@ -456,6 +768,8 @@ check_dies(
     qr/parameter 'content' is not valid base64/,
     sub { call_file_write($file_path, 'a') },
 );
+
+check_worker_interruption();
 
 my $task_count = 0;
 for my $log (glob('/var/log/pve/tasks/*/UPID*')) {
