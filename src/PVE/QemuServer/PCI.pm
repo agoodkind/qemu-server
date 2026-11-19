@@ -3,6 +3,7 @@ package PVE::QemuServer::PCI;
 use warnings;
 use strict;
 
+use Errno qw(ENOENT);
 use IO::File;
 
 use PVE::JSONSchema;
@@ -413,6 +414,13 @@ my sub print_pcie_root_port {
     return $res;
 }
 
+sub lock_hostpci_for_start {
+    my ($conf) = @_;
+    return undef if !grep { /\Ahostpci\d+\z/ } keys %$conf;
+    require PVE::SRIOVLock;
+    return PVE::SRIOVLock::lock_attachment();
+}
+
 # returns the parsed pci config but parses the 'host' part into
 # a list if lists into the 'id' property like this:
 #
@@ -748,6 +756,7 @@ my $PCIID_RESERVATION_LOCK = "${PCIID_RESERVATION_FILE}.lock";
 # for successfully started VM processes, or a expiration time for the initial time window between
 # reservation and actual VM process start-up.
 my $parse_pci_reservation_unlocked = sub {
+    my ($strict) = @_;
     my $pci_ids = {};
     if (my $fh = IO::File->new($PCIID_RESERVATION_FILE, "r")) {
         while (my $line = <$fh>) {
@@ -756,8 +765,12 @@ my $parse_pci_reservation_unlocked = sub {
                     vmid => $2,
                     "$3" => $4,
                 };
+            } elsif ($strict) {
+                die "Invalid PCI reservation in $PCIID_RESERVATION_FILE.\n";
             }
         }
+    } elsif ($strict && $! != ENOENT) {
+        die "Cannot read $PCIID_RESERVATION_FILE: $!\n";
     }
     return $pci_ids;
 };
@@ -796,6 +809,12 @@ sub remove_pci_reservation {
         },
     );
     die $@ if $@;
+}
+
+# The reservation exists during startup before QEMU publishes its PID.
+sub get_reservation_owners {
+    my $reservations = $parse_pci_reservation_unlocked->(1);
+    return { map { $_ => $reservations->{$_}->{vmid} } keys %$reservations };
 }
 
 # return all currently reserved ids from the given vmid
