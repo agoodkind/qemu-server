@@ -811,10 +811,22 @@ sub remove_pci_reservation {
     die $@ if $@;
 }
 
-# The reservation exists during startup before QEMU publishes its PID.
+my $reservation_is_active = sub {
+    my ($reservation, $now) = @_;
+    return $reservation->{time} > $now if defined($reservation->{time});
+    my $running_pid = PVE::QemuServer::Helpers::vm_running_locally($reservation->{vmid});
+    return defined($running_pid) && $running_pid == $reservation->{pid};
+};
+
 sub get_reservation_owners {
     my $reservations = $parse_pci_reservation_unlocked->(1);
-    return { map { $_ => $reservations->{$_}->{vmid} } keys %$reservations };
+    my $now = time();
+    my %owners;
+    for my $pci (keys %$reservations) {
+        my $reservation = $reservations->{$pci};
+        $owners{$pci} = $reservation->{vmid} if $reservation_is_active->($reservation, $now);
+    }
+    return \%owners;
 }
 
 # return all currently reserved ids from the given vmid
@@ -848,22 +860,13 @@ sub reserve_pci_usage {
             for my $id ($requested_ids->@*) {
                 my $reservation = $reservation_list->{$id};
                 if ($reservation && $reservation->{vmid} != $vmid) {
-                    # check time based reservation
-                    die
-                        "PCI device '$id' is currently reserved for use by VMID '$reservation->{vmid}'\n"
-                        if defined($reservation->{time}) && $reservation->{time} > $ctime;
-
-                    if (my $reserved_pid = $reservation->{pid}) {
-                        # check running vm
-                        my $running_pid =
-                            PVE::QemuServer::Helpers::vm_running_locally($reservation->{vmid});
-                        if (defined($running_pid) && $running_pid == $reserved_pid) {
-                            die
-                                "PCI device '$id' already in use by VMID '$reservation->{vmid}'\n";
-                        } else {
-                            warn "leftover PCI reservation found for $id, lets take it...\n";
-                        }
+                    if ($reservation_is_active->($reservation, $ctime)) {
+                        die "PCI device '$id' is currently reserved for use by VMID '$reservation->{vmid}'\n"
+                            if defined($reservation->{time});
+                        die "PCI device '$id' already in use by VMID '$reservation->{vmid}'\n";
                     }
+                    warn "leftover PCI reservation found for $id, lets take it...\n"
+                        if defined($reservation->{pid});
                 } elsif ($reservation) {
                     # already reserved by the same vmid
                     if (my $reserved_time = $reservation->{time}) {
@@ -872,19 +875,11 @@ sub reserve_pci_usage {
                             my $old_timeout = $reservation->{time} - 5 - $ctime;
                             $timeout = $old_timeout if $old_timeout > $timeout;
                         }
-                    } elsif (my $reserved_pid = $reservation->{pid}) {
-                        my $running_pid =
-                            PVE::QemuServer::Helpers::vm_running_locally($reservation->{vmid});
-                        if (defined($running_pid) && $running_pid == $reservation->{pid}) {
-                            if (defined($pid)) {
-                                die
-                                    "PCI device '$id' already in use by running VMID '$reservation->{vmid}'\n";
-                            } elsif (defined($timeout)) {
-                                # ignore timeout reservation for running vms, can happen with e.g.
-                                # qm showcmd
-                                return;
-                            }
-                        }
+                    } elsif ($reservation_is_active->($reservation, $ctime)) {
+                        die "PCI device '$id' already in use by running VMID '$reservation->{vmid}'\n"
+                            if defined($pid);
+                        # qm showcmd can request a timed reservation for a running VM.
+                        return if defined($timeout);
                     }
                 }
 

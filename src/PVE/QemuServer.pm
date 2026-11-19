@@ -5635,7 +5635,11 @@ sub vm_start_nolock {
             die "VM $vmid still has a running QEMU process.\n"
                 if PVE::QemuServer::Helpers::vm_running_locally($vmid);
         }
-        cleanup_pci_devices($vmid, $conf);
+        eval { cleanup_pci_devices($vmid, $conf) };
+        my $cleanup_error = $@;
+        eval { PVE::Storage::deactivate_volumes($storecfg, $vollist) };
+        $cleanup_error .= $@;
+        die $cleanup_error if $cleanup_error;
     };
     my ($cmd, $spice_port, $start_timeout);
     my $pci_reserve_list = [];
@@ -5843,11 +5847,10 @@ sub vm_start_nolock {
     if (my $err = $@) {
         if ($attachment_lock) {
             eval { $teardown_attachment->() };
-            die "start failed: $err\nPCI device teardown failed: $@" if $@;
-        }
-        eval { PVE::Storage::deactivate_volumes($storecfg, $vollist); };
-        warn $@ if $@;
-        if (!$attachment_lock) {
+            die "start failed: $err\nVM cleanup failed: $@" if $@;
+        } else {
+            eval { PVE::Storage::deactivate_volumes($storecfg, $vollist); };
+            warn $@ if $@;
             eval { cleanup_pci_devices($vmid, $conf) };
             warn $@ if $@;
         }
@@ -5866,7 +5869,7 @@ sub vm_start_nolock {
             eval { $teardown_attachment->() };
             my $teardown = $@;
             die "Could not register the PCI devices for VM $vmid: $error"
-                . ($teardown ? "PCI reservations remain protected after teardown failed: $teardown" : '');
+                . ($teardown ? "VM cleanup failed: $teardown" : '');
         }
         warn $error;
     }
