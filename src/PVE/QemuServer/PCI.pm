@@ -3,6 +3,7 @@ package PVE::QemuServer::PCI;
 use warnings;
 use strict;
 
+use Errno qw(ENOENT);
 use Fcntl qw(SEEK_SET);
 use IO::File;
 
@@ -222,6 +223,7 @@ sub get_pci_addr_map {
         'pci.4' => { bus => 1, addr => 28 },
         'rng0' => { bus => 1, addr => 29 },
         'pci.2-igd' => { bus => 1, addr => 30 }, # replaces pci.2 in case a legacy IGD device is passed through
+        'vsock' => { bus => 1, addr => 31 },
         'virtio6' => { bus => 2, addr => 1 },
         'virtio7' => { bus => 2, addr => 2 },
         'virtio8' => { bus => 2, addr => 3 },
@@ -412,6 +414,13 @@ my sub print_pcie_root_port {
     }
 
     return $res;
+}
+
+sub lock_hostpci_for_start {
+    my ($conf) = @_;
+    return undef if !grep { /\Ahostpci\d+\z/ } keys %$conf;
+    require PVE::SRIOVLock;
+    return PVE::SRIOVLock::lock_attachment();
 }
 
 # returns the parsed pci config but parses the 'host' part into
@@ -826,6 +835,7 @@ my $PCIID_RESERVATION_LOCK = "${PCIID_RESERVATION_FILE}.lock";
 # for successfully started VM processes, or a expiration time for the initial time window between
 # reservation and actual VM process start-up.
 my $parse_pci_reservation_unlocked = sub {
+    my ($strict) = @_;
     my $pci_ids = {};
     if (my $fh = IO::File->new($PCIID_RESERVATION_FILE, "r")) {
         while (my $line = <$fh>) {
@@ -834,8 +844,12 @@ my $parse_pci_reservation_unlocked = sub {
                     vmid => $2,
                     "$3" => $4,
                 };
+            } elsif ($strict) {
+                die "Invalid PCI reservation in $PCIID_RESERVATION_FILE.\n";
             }
         }
+    } elsif ($strict && $! != ENOENT) {
+        die "Cannot read $PCIID_RESERVATION_FILE: $!\n";
     }
     return $pci_ids;
 };
@@ -876,6 +890,24 @@ sub remove_pci_reservation {
     die $@ if $@;
 }
 
+my $reservation_is_active = sub {
+    my ($reservation, $now) = @_;
+    return $reservation->{time} > $now if defined($reservation->{time});
+    my $running_pid = PVE::QemuServer::Helpers::vm_running_locally($reservation->{vmid});
+    return defined($running_pid) && $running_pid == $reservation->{pid};
+};
+
+sub get_reservation_owners {
+    my $reservations = $parse_pci_reservation_unlocked->(1);
+    my $now = time();
+    my %owners;
+    for my $pci (keys %$reservations) {
+        my $reservation = $reservations->{$pci};
+        $owners{$pci} = $reservation->{vmid} if $reservation_is_active->($reservation, $now);
+    }
+    return \%owners;
+}
+
 # return all currently reserved ids from the given vmid
 sub get_reservations {
     my ($vmid) = @_;
@@ -907,23 +939,13 @@ sub reserve_pci_usage {
             for my $id ($requested_ids->@*) {
                 my $reservation = $reservation_list->{$id};
                 if ($reservation && $reservation->{vmid} != $vmid) {
-                    # check time based reservation
-                    if (defined($reservation->{time}) && $reservation->{time} > $ctime) {
-                        die "PCI device '$id' is currently reserved for use by VMID"
-                            . " '$reservation->{vmid}'\n";
+                    if ($reservation_is_active->($reservation, $ctime)) {
+                        die "PCI device '$id' is currently reserved for use by VMID '$reservation->{vmid}'\n"
+                            if defined($reservation->{time});
+                        die "PCI device '$id' already in use by VMID '$reservation->{vmid}'\n";
                     }
-
-                    if (my $reserved_pid = $reservation->{pid}) {
-                        # check running vm
-                        my $running_pid =
-                            PVE::QemuServer::Helpers::vm_running_locally($reservation->{vmid});
-                        if (defined($running_pid) && $running_pid == $reserved_pid) {
-                            die
-                                "PCI device '$id' already in use by VMID '$reservation->{vmid}'\n";
-                        } else {
-                            warn "leftover PCI reservation found for $id, lets take it...\n";
-                        }
-                    }
+                    warn "leftover PCI reservation found for $id, lets take it...\n"
+                        if defined($reservation->{pid});
                 } elsif ($reservation) {
                     # already reserved by the same vmid
                     if (my $reserved_time = $reservation->{time}) {
@@ -932,19 +954,11 @@ sub reserve_pci_usage {
                             my $old_timeout = $reservation->{time} - 5 - $ctime;
                             $timeout = $old_timeout if $old_timeout > $timeout;
                         }
-                    } elsif (my $reserved_pid = $reservation->{pid}) {
-                        my $running_pid =
-                            PVE::QemuServer::Helpers::vm_running_locally($reservation->{vmid});
-                        if (defined($running_pid) && $running_pid == $reservation->{pid}) {
-                            if (defined($pid)) {
-                                die
-                                    "PCI device '$id' already in use by running VMID '$reservation->{vmid}'\n";
-                            } elsif (defined($timeout)) {
-                                # ignore timeout reservation for running vms, can happen with e.g.
-                                # qm showcmd
-                                return;
-                            }
-                        }
+                    } elsif ($reservation_is_active->($reservation, $ctime)) {
+                        die "PCI device '$id' already in use by running VMID '$reservation->{vmid}'\n"
+                            if defined($pid);
+                        # qm showcmd can request a timed reservation for a running VM.
+                        return if defined($timeout);
                     }
                 }
 

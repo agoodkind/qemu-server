@@ -558,6 +558,12 @@ args: -no-reboot -smbios 'type=0,vendor=FOO'
 NOTE: this option is for experts only.
 EODESCR
     },
+    vsock => {
+        optional => 1,
+        type => 'boolean',
+        description => "Enable a virtio vsock device with the VM ID as its guest CID.",
+        default => 0,
+    },
     tablet => {
         optional => 1,
         type => 'boolean',
@@ -3297,6 +3303,11 @@ sub config_to_command {
         push @$devices, '-device', 'vmgenid,guid=' . $conf->{vmgenid};
     }
 
+    if ($conf->{vsock}) {
+        push @$devices, '-device',
+            "vhost-vsock-pci,id=vsock0,guest-cid=$vmid" . print_pci_addr('vsock', $arch);
+    }
+
     # add usb controllers
     my @usbcontrollers = PVE::QemuServer::USB::get_usb_controllers($conf, $arch, $machine_version);
     push @$devices, @usbcontrollers if @usbcontrollers;
@@ -5556,6 +5567,19 @@ sub vm_start_nolock {
     my $vollist = get_current_vm_volumes($storecfg, $conf);
     push $vollist->@*, $statefile if $statefile_is_a_volume;
 
+    my $attachment_lock = PVE::QemuServer::PCI::lock_hostpci_for_start($conf);
+    my $teardown_attachment = sub {
+        if (PVE::QemuServer::Helpers::vm_running_locally($vmid)) {
+            _do_vm_stop($storecfg, $vmid, 1, 1, 10, 0, 1);
+            die "VM $vmid still has a running QEMU process.\n"
+                if PVE::QemuServer::Helpers::vm_running_locally($vmid);
+        }
+        eval { cleanup_pci_devices($vmid, $conf) };
+        my $cleanup_error = $@;
+        eval { PVE::Storage::deactivate_volumes($storecfg, $vollist) };
+        $cleanup_error .= $@;
+        die $cleanup_error if $cleanup_error;
+    };
     my ($cmd, $spice_port, $start_timeout);
     my $pci_reserve_list = [];
     eval {
@@ -5785,12 +5809,26 @@ sub vm_start_nolock {
         eval { $run_qemu->() };
     }
 
-    if (my $err = $@) {
-        # deactivate volumes if start fails
-        eval { PVE::Storage::deactivate_volumes($storecfg, $vollist); };
-        warn $@ if $@;
-        eval { cleanup_pci_devices($vmid, $conf) };
-        warn $@ if $@;
+    my $start_error = $@;
+    if (!$start_error && $attachment_lock) {
+        # Complete physical attachment before normal shutdown cleanup becomes active.
+        eval {
+            my $pid = PVE::QemuServer::Helpers::vm_running_locally($vmid);
+            die "Cannot find the running PID for VM $vmid.\n" if @$pci_reserve_list && !$pid;
+            PVE::QemuServer::PCI::reserve_pci_usage($pci_reserve_list, $vmid, undef, $pid);
+        };
+        $start_error = "Could not register the PCI devices for VM $vmid: $@" if $@;
+    }
+    if (my $err = $start_error) {
+        if ($attachment_lock) {
+            eval { $teardown_attachment->() };
+            die "start failed: $err\nVM cleanup failed: $@" if $@;
+        } else {
+            eval { PVE::Storage::deactivate_volumes($storecfg, $vollist); };
+            warn $@ if $@;
+            eval { cleanup_pci_devices($vmid, $conf) };
+            warn $@ if $@;
+        }
 
         die "start failed: $err";
     }
@@ -5799,8 +5837,11 @@ sub vm_start_nolock {
 
     # re-reserve all PCI IDs now that we can know the actual VM PID
     my $pid = PVE::QemuServer::Helpers::vm_running_locally($vmid);
-    eval { PVE::QemuServer::PCI::reserve_pci_usage($pci_reserve_list, $vmid, undef, $pid) };
-    warn $@ if $@;
+    if (!$attachment_lock) {
+        eval { PVE::QemuServer::PCI::reserve_pci_usage($pci_reserve_list, $vmid, undef, $pid) };
+        warn $@ if $@;
+    }
+    undef $attachment_lock;
 
     my $qemu_pkg_string = PVE::QemuServer::QMPHelpers::get_qemu_package_string($vmid);
     syslog("info", "VM $vmid started with PID $pid using $qemu_pkg_string.");

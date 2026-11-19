@@ -66,6 +66,7 @@ use PVE::Network;
 use PVE::Firewall;
 use PVE::API2::Firewall::VM;
 use PVE::API2::Qemu::Agent;
+use PVE::API2::Qemu::Guest;
 use PVE::API2::Qemu::HMPPerms;
 use PVE::VZDump::Plugin;
 use PVE::DataCenterConfig;
@@ -1131,6 +1132,8 @@ my $check_vm_modify_config_perm = sub {
             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Memory']);
         } elsif ($hwtypeoptions->{$opt}) {
             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.HWType']);
+        } elsif ($opt eq 'vsock') {
+            $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Vsock']);
         } elsif ($generaloptions->{$opt}) {
             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Options']);
             # special case for startup since it changes host behaviour
@@ -1811,6 +1814,11 @@ __PACKAGE__->register_method({
             { subdir => 'firewall' },
             { subdir => 'mtunnel' },
             { subdir => 'remote_migrate' },
+            { subdir => 'exec' },
+            { subdir => 'exec-status' },
+            { subdir => 'exec-ack' },
+            { subdir => 'file-read' },
+            { subdir => 'file-write' },
         ];
 
         return $res;
@@ -1826,6 +1834,8 @@ __PACKAGE__->register_method({
     subclass => "PVE::API2::Qemu::Agent",
     path => '{vmid}/agent',
 });
+
+PVE::API2::Qemu::Guest::register_methods(__PACKAGE__);
 
 __PACKAGE__->register_method({
     name => 'rrd',
@@ -2335,6 +2345,11 @@ my $update_vm_api = sub {
 
     &$check_vm_modify_config_perm($rpcenv, $authuser, $vmid, undef, [keys %$param]);
 
+    # revert copies the current value into $param after this point, so check it here
+    &$check_vm_modify_config_perm(
+        $rpcenv, $authuser, $vmid, undef, [grep { $_ eq 'vsock' } keys %$revert],
+    );
+
     &$check_storage_access(
         $rpcenv, $authuser, $storecfg, $vmid, $param, undef, $extraction_storage,
     );
@@ -2785,6 +2800,7 @@ my $vm_config_perm_list = [
     'VM.Config.Memory',
     'VM.Config.Network',
     'VM.Config.HWType',
+    'VM.Config.Vsock',
     'VM.Config.Options',
     'VM.Config.Cloudinit',
 ];
